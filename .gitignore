@@ -1,0 +1,14 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+checkpoints/
+logs/
+humanoid_walk_final.pth
+vec_normalize.pkl
+
+# Virtual environments
+.venv
