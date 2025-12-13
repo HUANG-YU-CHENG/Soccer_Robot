@@ -9,6 +9,6 @@ checkpoints/
 logs/
 humanoid_walk_final.pth
 vec_normalize.pkl
-
+humanoid_soccer_final
 # Virtual environments
 .venv
