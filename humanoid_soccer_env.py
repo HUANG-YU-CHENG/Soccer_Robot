@@ -1,5 +1,5 @@
 """
-HumanoidSoccerEnv - 人形機器人足球環境
+HumanoidSoccerEnv - 人形機器人足球環境 (修正版)
 
 這個環境讓 humanoid 機器人學習走向足球並踢向球門。
 基於 Gymnasium 的 MujocoEnv 建立。
@@ -18,38 +18,17 @@ import os
 from gymnasium import utils
 from gymnasium.envs.mujoco import MujocoEnv
 from gymnasium.spaces import Box
+import mujoco
 
 
 class HumanoidSoccerEnv(MujocoEnv, utils.EzPickle):
     """
     人形機器人足球環境
-    
-    觀察空間 (348 維)：
-        - humanoid 的 qpos (24維): 位置
-        - humanoid 的 qvel (23維): 速度
-        - cinert (140維): 慣性
-        - cvel (84維): 質心速度
-        - qfrc_actuator (23維): 作用力
-        - cfrc_ext (84維): 外部接觸力
-        - 球的位置 (3維): ball_pos
-        - 球的速度 (3維): ball_vel
-        - 球到球門的向量 (3維): ball_to_goal
-        - 機器人到球的向量 (3維): robot_to_ball
-    
-    動作空間 (21 維)：
-        - 21 個關節的力矩
-    
-    獎勵函數：
-        - 接近球的獎勵
-        - 球移動向球門的獎勵
-        - 進球大獎
-        - 跌倒懲罰
-        - 存活獎勵
     """
     
     metadata = {
         "render_modes": ["human", "rgb_array", "depth_array"],
-        "render_fps": 67,  # 基於 timestep=0.003 和 frame_skip=5
+        "render_fps": 67,
     }
     
     def __init__(
@@ -64,11 +43,11 @@ class HumanoidSoccerEnv(MujocoEnv, utils.EzPickle):
         healthy_z_range: tuple = (0.8, 2.1),
         reset_noise_scale: float = 1e-2,
         # 足球相關參數
-        ball_reward_weight: float = 2.0,       # 接近球的獎勵權重
-        kick_reward_weight: float = 5.0,       # 踢球向球門的獎勵權重
-        goal_reward: float = 100.0,            # 進球獎勵
-        ball_initial_distance: float = 1.5,    # 球的初始距離
-        goal_position: tuple = (5.0, 0.0, 0.0), # 球門位置
+        ball_reward_weight: float = 2.0,
+        kick_reward_weight: float = 5.0,
+        goal_reward: float = 100.0,
+        ball_initial_distance: float = 1.5,
+        goal_position: tuple = (5.0, 0.0, 0.0),
         **kwargs,
     ):
         utils.EzPickle.__init__(
@@ -104,25 +83,15 @@ class HumanoidSoccerEnv(MujocoEnv, utils.EzPickle):
         self._ball_initial_distance = ball_initial_distance
         self._goal_position = np.array(goal_position)
         
-        # 追蹤上一步的球位置（用於計算球的移動）
-        self._prev_ball_pos = None
-        
         # 如果沒指定 xml_file，使用預設路徑
         if xml_file is None:
             xml_file = os.path.join(os.path.dirname(__file__), "humanoid_soccer.xml")
-        
-        # 設定觀察空間
-        # 先暫時設一個較大的值，之後會在 _get_obs 中自動調整
-        # humanoid qpos(24) + qvel(23) + 球相關(12) = 基礎 59
-        # 但實際會包含更多資訊（cinert, cvel, etc.）
-        # 我們先設為 None，讓 MujocoEnv 自動推斷
-        observation_space = None  # 會在初始化後重新設定
         
         # 預設相機設定
         if default_camera_config is None:
             default_camera_config = {
                 "trackbodyid": 1,
-                "distance": 4.0,
+                "distance": 5.0,
                 "lookat": np.array([0.0, 0.0, 1.0]),
                 "elevation": -20.0,
             }
@@ -131,14 +100,28 @@ class HumanoidSoccerEnv(MujocoEnv, utils.EzPickle):
             self,
             xml_file,
             frame_skip,
+            observation_space=None,  # 先設為 None，稍後會重新設定
             default_camera_config=default_camera_config,
-            observation_space=observation_space,
             **kwargs,
         )
         
-        # 找到球的 body id
-        self._ball_body_id = self.model.body("ball").id
-        self._ball_joint_id = self.model.joint("ball_joint").id
+        # ========== 關鍵：正確找到球的 qpos/qvel 位置 ==========
+        self._ball_joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "ball_joint")
+        self._ball_qpos_adr = self.model.jnt_qposadr[self._ball_joint_id]
+        self._ball_qvel_adr = self.model.jnt_dofadr[self._ball_joint_id]
+        
+        # humanoid root joint
+        self._root_joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "root")
+        self._root_qpos_adr = self.model.jnt_qposadr[self._root_joint_id]
+        
+        # humanoid 的 qpos 數量（root 之後到 ball 之前）
+        self._humanoid_qpos_end = self._ball_qpos_adr
+        self._humanoid_qvel_end = self._ball_qvel_adr
+        
+        print(f"[DEBUG] ball qpos 起始: {self._ball_qpos_adr}, qvel 起始: {self._ball_qvel_adr}")
+        print(f"[DEBUG] humanoid qpos 範圍: 0-{self._humanoid_qpos_end}, qvel 範圍: 0-{self._humanoid_qvel_end}")
+        print(f"[DEBUG] init_qpos[:7] (humanoid 位置+姿態): {self.init_qpos[:7]}")
+        print(f"[DEBUG] init_qpos 球位置: {self.init_qpos[self._ball_qpos_adr:self._ball_qpos_adr+3]}")
         
         # 初始化後，根據實際觀察重新設定觀察空間
         sample_obs = self._get_obs()
@@ -156,6 +139,7 @@ class HumanoidSoccerEnv(MujocoEnv, utils.EzPickle):
     @property
     def is_healthy(self):
         min_z, max_z = self._healthy_z_range
+        # humanoid 的 z 位置在 qpos[2]
         is_healthy = min_z < self.data.qpos[2] < max_z
         return is_healthy
     
@@ -166,21 +150,11 @@ class HumanoidSoccerEnv(MujocoEnv, utils.EzPickle):
     
     def _get_ball_position(self):
         """獲取球的位置"""
-        # 球的 qpos 在 humanoid qpos 之後
-        # humanoid 有 24 個 qpos (7 for root + 17 joints)
-        # 球的 freejoint 有 7 個 qpos (3 pos + 4 quat)
-        ball_qpos_start = 24  # humanoid 的 qpos 數量
-        ball_pos = self.data.qpos[ball_qpos_start:ball_qpos_start + 3].copy()
-        return ball_pos
+        return self.data.qpos[self._ball_qpos_adr:self._ball_qpos_adr + 3].copy()
     
     def _get_ball_velocity(self):
         """獲取球的速度"""
-        # 球的 qvel 在 humanoid qvel 之後
-        # humanoid 有 23 個 qvel
-        # 球的 freejoint 有 6 個 qvel (3 linear + 3 angular)
-        ball_qvel_start = 23  # humanoid 的 qvel 數量
-        ball_vel = self.data.qvel[ball_qvel_start:ball_qvel_start + 3].copy()
-        return ball_vel
+        return self.data.qvel[self._ball_qvel_adr:self._ball_qvel_adr + 3].copy()
     
     def _get_robot_position(self):
         """獲取機器人（軀幹）的位置"""
@@ -188,17 +162,9 @@ class HumanoidSoccerEnv(MujocoEnv, utils.EzPickle):
     
     def _get_obs(self):
         """組合觀察空間"""
-        # 獲取 humanoid 的 qpos 和 qvel（排除球的部分）
-        # humanoid 有 24 個 qpos，23 個 qvel
-        position = self.data.qpos[:24].flat.copy()
-        velocity = self.data.qvel[:23].flat.copy()
-        
-        # cinert, cvel, qfrc_actuator, cfrc_ext 的大小取決於模型
-        # 我們取所有可用的資料
-        com_inertia = self.data.cinert.flat.copy()
-        com_velocity = self.data.cvel.flat.copy()
-        actuator_forces = self.data.qfrc_actuator[:23].flat.copy()  # 只取 humanoid 的
-        external_contact_forces = self.data.cfrc_ext.flat.copy()
+        # humanoid 的 qpos 和 qvel（不包含球）
+        position = self.data.qpos[:self._humanoid_qpos_end].flat.copy()
+        velocity = self.data.qvel[:self._humanoid_qvel_end].flat.copy()
         
         # 球的資訊
         ball_pos = self._get_ball_position()
@@ -209,13 +175,10 @@ class HumanoidSoccerEnv(MujocoEnv, utils.EzPickle):
         ball_to_goal = self._goal_position - ball_pos
         robot_to_ball = ball_pos - robot_pos
         
+        # 簡化的觀察空間（不包含 cinert, cvel 等複雜資訊）
         return np.concatenate([
             position,
             velocity,
-            com_inertia,
-            com_velocity,
-            actuator_forces,
-            external_contact_forces,
             ball_pos,
             ball_vel,
             ball_to_goal,
@@ -269,29 +232,25 @@ class HumanoidSoccerEnv(MujocoEnv, utils.EzPickle):
         # ==================== 終止條件 ====================
         terminated = self.terminated
         
-        # 如果進球也終止
         if goal_reward > 0:
             terminated = True
         
-        # 獲取觀察
         observation = self._get_obs()
         
-        # 資訊
         info = {
             "reward_survive": healthy_reward,
             "reward_ctrl": -ctrl_cost,
             "reward_approach_ball": approach_ball_reward,
             "reward_kick": kick_reward,
             "reward_goal": goal_reward,
-            "robot_position": robot_pos_after,
-            "ball_position": ball_pos_after,
+            "robot_position": robot_pos_after.copy(),
+            "ball_position": ball_pos_after.copy(),
             "distance_to_ball": dist_to_ball_after,
             "ball_to_goal_distance": ball_to_goal_after,
             "is_healthy": self.is_healthy,
             "goal_scored": goal_reward > 0,
         }
         
-        # truncated 由 TimeLimit wrapper 處理
         truncated = False
         
         return observation, reward, terminated, truncated, info
@@ -301,31 +260,55 @@ class HumanoidSoccerEnv(MujocoEnv, utils.EzPickle):
         noise_low = -self._reset_noise_scale
         noise_high = self._reset_noise_scale
         
-        # 重置 humanoid 位置
+        # 複製初始狀態（這包含 XML 中定義的初始位置）
         qpos = self.init_qpos.copy()
         qvel = self.init_qvel.copy()
         
-        # 加入隨機噪音到 humanoid
-        qpos[:24] = self.init_qpos[:24] + self.np_random.uniform(
-            low=noise_low, high=noise_high, size=24
-        )
-        qvel[:23] = self.init_qvel[:23] + self.np_random.uniform(
-            low=noise_low, high=noise_high, size=23
+        # ========== 重要：保留 humanoid 的初始高度 ==========
+        # init_qpos 已經包含 XML 中定義的正確位置 (0, 0, 1.4)
+        # 我們只對關節角度加噪音，不動位置和姿態
+        
+        # humanoid 的 qpos 結構：
+        # [0:3] = x, y, z 位置
+        # [3:7] = 四元數 (w, x, y, z) 姿態
+        # [7:] = 各關節角度
+        
+        # 只對關節角度加小噪音（從索引 7 開始到球之前）
+        joint_start = 7
+        joint_end = self._humanoid_qpos_end
+        num_joints = joint_end - joint_start
+        
+        if num_joints > 0:
+            qpos[joint_start:joint_end] += self.np_random.uniform(
+                low=noise_low, high=noise_high, size=num_joints
+            )
+        
+        # 對 humanoid 的速度加小噪音
+        qvel[:self._humanoid_qvel_end] += self.np_random.uniform(
+            low=noise_low, high=noise_high, size=self._humanoid_qvel_end
         )
         
-        # 重置球的位置（在機器人前方，加一點隨機性）
+        # ========== 重置球的位置 ==========
+        # 球放在機器人前方
         ball_x = self._ball_initial_distance + self.np_random.uniform(-0.3, 0.3)
-        ball_y = self.np_random.uniform(-0.5, 0.5)
-        ball_z = 0.11  # 球的半徑
+        ball_y = self.np_random.uniform(-0.3, 0.3)
+        ball_z = 0.15  # 稍微高一點，讓球自然落到地面
         
-        # 設定球的 qpos (位置 + 四元數)
-        qpos[24:27] = [ball_x, ball_y, ball_z]  # 位置
-        qpos[27:31] = [1, 0, 0, 0]  # 四元數（無旋轉）
+        # 設定球的 qpos (位置 xyz + 四元數 wxyz)
+        qpos[self._ball_qpos_adr:self._ball_qpos_adr + 3] = [ball_x, ball_y, ball_z]
+        qpos[self._ball_qpos_adr + 3:self._ball_qpos_adr + 7] = [1, 0, 0, 0]
         
         # 球的速度設為 0
-        qvel[23:29] = 0
+        qvel[self._ball_qvel_adr:self._ball_qvel_adr + 6] = 0
         
         self.set_state(qpos, qvel)
+        
+        # ========== 關鍵修正：讓機器人自然下落並穩定接地 ==========
+        # 執行幾步零動作（不輸入任何力），讓重力作用
+        # 這確保機器人腳部接觸地面，而不是依賴模型學會對抗重力
+        zero_action = np.zeros(self.action_space.shape[0])
+        for _ in range(10):
+            self.do_simulation(zero_action, self.frame_skip)
         
         return self._get_obs()
     
@@ -338,55 +321,84 @@ class HumanoidSoccerEnv(MujocoEnv, utils.EzPickle):
         robot_pos = self._get_robot_position()
         
         info.update({
-            "ball_position": ball_pos,
-            "robot_position": robot_pos,
+            "ball_position": ball_pos.copy(),
+            "robot_position": robot_pos.copy(),
             "distance_to_ball": np.linalg.norm(robot_pos[:2] - ball_pos[:2]),
             "ball_to_goal_distance": np.linalg.norm(self._goal_position[:2] - ball_pos[:2]),
         })
         
         return obs, info
-    
+
 
 def make_soccer_env(render_mode=None, **kwargs):
-    """
-    建立足球環境的輔助函數
-    
-    使用方式：
-        from humanoid_soccer_env import make_soccer_env
-        env = make_soccer_env(render_mode="human")
-    """
+    """建立足球環境的輔助函數"""
     return HumanoidSoccerEnv(render_mode=render_mode, **kwargs)
 
 
 # ==================== 測試程式碼 ====================
 if __name__ == "__main__":
-    print("測試 HumanoidSoccerEnv...")
+    import time
+    
+    print("=" * 60)
+    print("測試 HumanoidSoccerEnv")
+    print("=" * 60)
     
     # 建立環境
     env = HumanoidSoccerEnv(render_mode="human")
     
-    print(f"觀察空間: {env.observation_space.shape}")
-    print(f"動作空間: {env.action_space.shape}")
+    print(f"\n📊 環境資訊:")
+    print(f"   觀察空間: {env.observation_space.shape}")
+    print(f"   動作空間: {env.action_space.shape}")
     
     # 重置環境
     obs, info = env.reset()
-    print(f"初始觀察維度: {obs.shape}")
-    print(f"初始球位置: {info['ball_position']}")
-    print(f"初始機器人位置: {info['robot_position']}")
+    print(f"\n📍 初始狀態:")
+    print(f"   觀察維度: {obs.shape}")
+    print(f"   機器人位置: {info['robot_position']}")
+    print(f"   球位置: {info['ball_position']}")
+    print(f"   到球距離: {info['distance_to_ball']:.3f}")
+    print(f"   球到球門距離: {info['ball_to_goal_distance']:.3f}")
     
     # 跑幾步測試
-    for i in range(500000):
+    print(f"\n🎮 開始測試（觀察視窗中的機器人）...")
+    print(f"   提示：機器人會先從空中落下，然後開始隨機動作")
+    print(f"   因為是隨機動作，機器人會很快倒下，這是正常的！\n")
+    
+    episode_reward = 0
+    episode_count = 0
+    
+    for i in range(2000):
+        # 隨機動作
         action = env.action_space.sample()
         obs, reward, terminated, truncated, info = env.step(action)
+        episode_reward += reward
         
-        if i % 100 == 0:
-            print(f"Step {i}: reward={reward:.3f}, dist_to_ball={info['distance_to_ball']:.3f}")
+        # 強制渲染（確保視窗更新）
+        env.render()
         
-        if terminated or truncated:
-            print(f"Episode 結束於 step {i}")
+        # 稍微減慢速度，讓人眼能看清楚
+        time.sleep(0.01)
+        
+        if i % 200 == 0:
+            print(f"   Step {i:4d}: reward={reward:7.3f}, "
+                  f"dist_to_ball={info['distance_to_ball']:.3f}, "
+                  f"robot_z={info['robot_position'][2]:.3f}, "
+                  f"ball_z={info['ball_position'][2]:.3f}")
+        
+        if terminated:
+            episode_count += 1
+            print(f"\n⚠️  Episode {episode_count} 結束於 step {i}")
             if info.get('goal_scored'):
-                print("🎉 進球了！")
+                print("   🎉 進球了！")
+            else:
+                print("   💀 機器人倒下了 (robot_z={:.3f})".format(info['robot_position'][2]))
+            print(f"   累計獎勵: {episode_reward:.2f}")
+            episode_reward = 0
             obs, info = env.reset()
+            
+            if episode_count >= 10:
+                print("\n已完成 10 個 episode，結束測試")
+                break
     
     env.close()
-    print("測試完成！")
+    print("\n✅ 測試完成！")

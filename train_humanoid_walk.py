@@ -42,7 +42,7 @@ checkpoint_callback = CheckpointCallback(
 # 開始訓練
 print("開始訓練...")
 model.learn(
-    total_timesteps=1_000_0000,  # 先跑 100 萬步看看
+    total_timesteps=1_000_000,  # 先跑 100 萬步看看
     callback=checkpoint_callback,
     progress_bar=True,
 )
